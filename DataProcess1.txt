@@ -1,0 +1,251 @@
+import pyspark
+from pyspark import SparkConf
+from pyspark.sql import SparkSession
+from pyspark.sql.types import IntegerType,BooleanType,DateType
+
+spark = SparkSession \
+    .builder \
+    .appName("Spark app") \
+    .getOrCreate()
+
+path = "s3://the-museum/flights"
+data = spark.read.format("csv")\
+    .option("recursiveFileLookup", "true")\
+    .option("header",True)\
+    .load(path)
+data.take(10)
+
+#remove some columns
+data = data.drop(*("ArrTime","ActualElapsedTime", "AirTime", "TaxiIn", "Diverted", "CarrierDelay", "WeatherDelay", "NASDelay", "SecurityDelay", "LateAircraftDelay", "CancellationCode", "FlightNum", "TailNum", "Year"))
+
+data = data.withColumn("DepTime",data.DepTime.cast('integer'))
+data = data.withColumn("CRSArrTime",data.CRSArrTime.cast('integer'))
+data = data.withColumn("CRSElapsedTime",data.CRSElapsedTime.cast('integer'))
+data = data.withColumn("ArrDelay",data.ArrDelay.cast('integer'))
+data = data.withColumn("Distance",data.Distance.cast('integer'))
+data = data.withColumn("CRSDepTime",data.CRSDepTime.cast('integer'))
+data = data.withColumn("TaxiOut",data.TaxiOut.cast('integer'))
+data = data.withColumn("DayOfWeek",data.DayOfWeek.cast('integer'))
+data = data.withColumn("DepDelay",data.DepDelay.cast('integer'))
+
+from pyspark.sql.functions import isnull, when, count, col
+
+data.select([count(when(col(c).isNull(), c)).alias(c) for c in data.columns]).show()
+
+data = data.replace('NA', None)
+data = data.na.drop()
+
+data = data.filter((data.Cancelled != 1))
+
+data = data.drop("Cancelled")
+
+data.select([count(when(col(c).isNull(), c)).alias(c) for c in data.columns]).show()
+
+data_num = data.drop("UniqueCarrier", "Origin", "Dest")
+data_num = data_num.withColumn("Month",data_num.Month.cast('integer'))
+data_num = data_num.withColumn("DayofMonth",data_num.DayofMonth.cast('integer'))
+data_num = data_num.withColumn("DepDelay",data_num.DepDelay.cast('integer'))
+
+data_num.printSchema()
+
+for i in data_num.columns:
+    print("Corr entre ArrDelay" + " et " + i + ": ", round(data_num.corr("ArrDelay", i, method=None), 5))
+
+#Drop the columns with a correlation < 0.05
+data = data.drop(*("Month", "DayofMonth", "DayOfWeek", "CRSElapsedTime", "Distance"))
+
+data.printSchema()
+
+data_mean_delay = data.select(*("UniqueCarrier", "DepDelay")).groupby("UniqueCarrier").avg()
+origin_delay = data.select(*("Origin","DepDelay")).groupby('Origin').avg()
+
+from pyspark.sql import Window
+import pyspark.sql.functions as psf
+
+wM = Window.orderBy(psf.desc("avg(DepDelay)"))
+data_mean_delay = data_mean_delay.withColumn(
+    "CarrierRank", 
+    psf.dense_rank().over(wM)
+)
+
+data_mean_delay = data_mean_delay.drop("avg(DepDelay")
+
+data = data.join(data_mean_delay, on=['UniqueCarrier'])
+
+data = data.drop("avg(DepDelay)")
+
+wO = Window.orderBy(psf.desc("avg(DepDelay)"))
+origin_delay = origin_delay.withColumn(
+    "OriginRank", 
+    psf.dense_rank().over(wO)
+)
+
+data = data.join(origin_delay, on=['Origin'])
+
+data = data.drop("avg(DepDelay)")
+
+data = data.drop(*('Origin', 'UniqueCarrier'))
+
+dest_delay = data.select(*("Dest","DepDelay")).groupby('Dest').avg()
+
+wD = Window.orderBy(psf.desc("avg(DepDelay)"))
+dest_delay = dest_delay.withColumn(
+    "DestRank", 
+    psf.dense_rank().over(wD)
+)
+
+data = data.join(dest_delay, on=['Dest'])
+
+data = data.drop("avg(DepDelay)")
+
+data = data.drop("Dest")
+
+data.printSchema()
+
+outliers_col = ["DepTime", "CRSDepTime", "CRSArrTime", "ArrDelay", "DepDelay", "TaxiOut"]
+
+bounds = {
+    c: dict(
+        zip(["q1", "q3"], data.approxQuantile(c, [0.25, 0.75], 0))
+    )
+    for c in outliers_col
+}
+
+for c in bounds:
+    iqr = bounds[c]['q3'] - bounds[c]['q1']
+    bounds[c]['lower'] = bounds[c]['q1'] - (iqr * 1.5)
+    bounds[c]['upper'] = bounds[c]['q3'] + (iqr * 1.5)
+print(bounds)
+
+import pyspark.sql.functions as f
+data = data.select(
+        "*",
+        *[
+            f.when(
+                f.col(c).between(bounds[c]['lower'], bounds[c]['upper']),
+                0
+            ).otherwise(1).alias(c+"_out") 
+            for c in outliers_col
+        ]
+)
+
+data.columns
+
+data.show()
+
+data = data.filter((data.DepTime_out != 1))
+data = data.filter((data.CRSDepTime_out != 1))
+data = data.filter((data.CRSArrTime_out != 1))
+data = data.filter((data.ArrDelay_out != 1))
+data = data.filter((data.DepDelay_out != 1))
+data = data.filter((data.TaxiOut_out != 1))
+
+data = data.drop(*("DepTime_out", "CRSDepTime_out", "CRSArrTime_out", "ArrDelay_out", "DepDelay_out", "TaxiOut_out"))
+
+data.columns
+
+print((data.count(), len(data.columns)))
+
+filePath = "s3://the-museum/flights/2006_outliers"
+
+data.write.option("header",True) \
+          .option("delimiter",",") \
+          .csv(filePath)
+
+#See if the download is OK
+
+path2 = "s3://the-museum/flights/2006_outliers"
+df_outliers = spark.read.format("csv")\
+    .option("recursiveFileLookup", "true")\
+    .option("header",True)\
+    .load(path2)
+
+df_outliers.show()
+
+from pyspark.ml.feature import VectorAssembler
+
+ignore = ['ArrDelay']
+assembler = VectorAssembler(
+    inputCols=[x for x in data.columns if x not in ignore],
+    outputCol='features')
+
+data = assembler.transform(data)
+
+data_ml = data.select(['features', 'ArrDelay'])
+
+data_ml.show()
+
+data_pca = data.sample(0.05)
+
+from pyspark.ml.feature import PCA
+pca = PCA(k=2, inputCol="features")
+pca.setOutputCol("pca_features")
+
+model = pca.fit(data_pca)
+
+model.setOutputCol("output")
+
+model.explainedVariance
+
+df_pca = model.transform(data_pca)
+
+df_pca.show(6)
+
+data.head(5)
+
+data_stripplot = data.drop(*('Month', 'DayofMonth', 'DayOfWeek', 'DepTime', 'CRSDepTime', 'CRSArrTime', 'CRSElapsedTime',
+                             'ArrDelay', 'Dest', 'Distance', 'TaxiOut', 'DestRank', 'OriginRank'))
+
+data_stripplot.columns
+
+spark.conf.set("spark.sql.execution.arrow.enabled","true")
+data_stripplot_pandas = data_stripplot.toPandas()
+
+import seaborn as sns
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+colors = ['firebrick', 'gold', 'lightcoral', 'aquamarine', 'c', 'yellowgreen', 'grey',
+          'seagreen', 'tomato', 'violet', 'wheat', 'chartreuse', 'lightskyblue', 'royalblue']
+
+ax3 = sns.stripplot(y="CarrierRank", x="DepDelay", size = 4, palette = colors,
+                    data=data_stripplot_pandas, linewidth = 0.5,  jitter=True)
+
+plt.setp(ax3.get_xticklabels(), fontsize=14)
+plt.setp(ax3.get_yticklabels(), fontsize=14)
+ax3.set_xticklabels(['{:2.0f}h{:2.0f}m'.format(*[int(y) for y in divmod(x,60)])
+                         for x in ax3.get_xticks()])
+plt.xlabel('Departure delay', fontsize=18, bbox={'facecolor':'midnightblue', 'pad':5},
+           color='w', labelpad=20)
+ax3.yaxis.label.set_visible(False)
+
+plt.tight_layout(w_pad=3) 
+
+
+
+#Split the data
+(training_data, test_data) = data_ml.randomSplit([0.8,0.2])
+
+from pyspark.ml.regression import LinearRegression
+
+lr = LinearRegression(featuresCol = 'features', labelCol='ArrDelay', maxIter=10, regParam=0.3, elasticNetParam=0.8)
+lr_model = lr.fit(training_data)
+print("Coefficients: " + str(lr_model.coefficients))
+print("Intercept: " + str(lr_model.intercept))
+
+trainingSummary = lr_model.summary
+print("RMSE: %f" % trainingSummary.rootMeanSquaredError)
+print("r2: %f" % trainingSummary.r2)
+
+lr_predictions = lr_model.transform(test_data)
+#lr_predictions.select("prediction","ArrDelay","features").show(5)
+
+from pyspark.ml.evaluation import RegressionEvaluator
+
+lr_evaluator = RegressionEvaluator(predictionCol="prediction", \
+                 labelCol="ArrDelay",metricName="r2")
+print("R Squared (R2) on test data = %g" % lr_evaluator.evaluate(lr_predictions))
+
+lr_evaluator_rmse = RegressionEvaluator(predictionCol="prediction", \
+                 labelCol="ArrDelay",metricName="rmse")
+print("RMSE: %f" % lr_evaluator_rmse.evaluate(lr_predictions))
