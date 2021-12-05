@@ -114,13 +114,12 @@ if __name__ == "__main__":
     data_path = args.data  
     # load the data
     flightDelay_data=data_loader(data_path)
+    
+########################Data cleaning####################
     # pre-pre-processing
     flightDelay_data = data_cleaner(flightDelay_data)
-    # feature engineering
-    # category feature encoding
-    flightDelay_data  = flightDelay_data.withColumnRenamed("ArrDelay", "label")
     #vectorize the data
-    
+    from pyspark.ml.feature import VectorAssembler
     data = flightDelay_data
     ignore = ['ArrDelay']
     assembler = VectorAssembler(
@@ -131,7 +130,10 @@ if __name__ == "__main__":
     data = data.withColumnRenamed("ArrDelay", "label")
     # Split the data into training and test sets (30% held out for testing)
     (trainingData, testData) = data.randomSplit([0.7, 0.3])
-
+    from pyspark.ml import Pipeline
+    from pyspark.ml.regression import LinearRegression
+    from pyspark.ml.evaluation import RegressionEvaluator
+    from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
     
 ########################LinearRegression Model training####################
     
