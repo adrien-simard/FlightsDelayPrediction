@@ -165,7 +165,7 @@ if __name__ == "__main__":
     eval_r2 = RegressionEvaluator(metricName="r2")
     eval_rmse.evaluate(cvModel.transform(testData))
     print("r2", eval_r2 )
-    cvModel.bestModel.save()
+    cvModel.bestModel.save('lr_model')
     
 ########################DecisionTreeRegressor Model training####################
     from pyspark.ml.regression import DecisionTreeRegressor
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     print("r2", eval_r2 )
     cvModel_dt.bestModel.save()
 
-    spark.stop()
+    spark.stop('dt_model')
     
     
     
